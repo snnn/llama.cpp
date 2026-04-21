@@ -20,11 +20,31 @@
 #include <unordered_set>
 
 #include "build-info.h"
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include "common.h"
 #include "download.h"
 #include "fit.h"
 #include "ggml.h"
 #include "llama.h"
+
+#if defined(__linux__) && defined(__has_include)
+#if __has_include(<sys/sdt.h>)
+#include <sys/sdt.h>
+#define LLAMA_BENCH_SECTION_BEGIN(section) \
+    STAP_PROBE1(llama_cpp_llm, bench_section_begin, section)
+#define LLAMA_BENCH_SECTION_END(section) \
+    STAP_PROBE1(llama_cpp_llm, bench_section_end, section)
+#else
+#define LLAMA_BENCH_SECTION_BEGIN(section)
+#define LLAMA_BENCH_SECTION_END(section)
+#endif
+#else
+#define LLAMA_BENCH_SECTION_BEGIN(section)
+#define LLAMA_BENCH_SECTION_END(section)
+#endif
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -38,6 +58,72 @@
 static uint64_t get_time_ns() {
     using clock = std::chrono::high_resolution_clock;
     return std::chrono::nanoseconds(clock::now().time_since_epoch()).count();
+}
+
+static bool llama_bench_usdt_trace_enabled() {
+    const char * value = std::getenv("LLAMA_USDT_TRACE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+enum llama_bench_usdt_section : int32_t {
+    LLAMA_BENCH_SECTION_PROMPT = 1,
+    LLAMA_BENCH_SECTION_GEN = 2,
+};
+
+static const char * llama_bench_trace_fifo_path() {
+    const char * value = std::getenv("LLAMA_TRACE_FIFO");
+    return value != nullptr && value[0] != '\0' ? value : nullptr;
+}
+
+static const char * llama_bench_trace_section_name(int section) {
+    switch (section) {
+        case LLAMA_BENCH_SECTION_PROMPT: return "prompt";
+        case LLAMA_BENCH_SECTION_GEN:    return "gen";
+        default:                         return "unknown";
+    }
+}
+
+static void llama_bench_trace_fifo_emit(const char * action, int section) {
+#if defined(__linux__)
+    const char * path = llama_bench_trace_fifo_path();
+    if (path == nullptr) {
+        return;
+    }
+
+    const int fd = open(path, O_WRONLY | O_NONBLOCK);
+    if (fd < 0) {
+        return;
+    }
+
+    char line[96];
+    const int len = std::snprintf(
+        line,
+        sizeof(line),
+        "section_%s %s\n",
+        action,
+        llama_bench_trace_section_name(section));
+    if (len > 0) {
+        (void) write(fd, line, static_cast<size_t>(len));
+    }
+    close(fd);
+#else
+    (void) action;
+    (void) section;
+#endif
+}
+
+static void llama_bench_trace_section_begin(int section) {
+    llama_bench_trace_fifo_emit("begin", section);
+    if (llama_bench_usdt_trace_enabled()) {
+        LLAMA_BENCH_SECTION_BEGIN(section);
+    }
+}
+
+static void llama_bench_trace_section_end(int section) {
+    if (llama_bench_usdt_trace_enabled()) {
+        LLAMA_BENCH_SECTION_END(section);
+    }
+    llama_bench_trace_fifo_emit("end", section);
 }
 
 static bool tensor_buft_override_equal(const llama_model_tensor_buft_override& a, const llama_model_tensor_buft_override& b) {
@@ -2368,6 +2454,7 @@ int main(int argc, char ** argv) {
             uint64_t t_start = get_time_ns();
 
             if (t.n_prompt > 0) {
+                llama_bench_trace_section_begin(LLAMA_BENCH_SECTION_PROMPT);
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
@@ -2379,8 +2466,10 @@ int main(int argc, char ** argv) {
                     llama_model_free(lmodel);
                     exit(1);
                 }
+                llama_bench_trace_section_end(LLAMA_BENCH_SECTION_PROMPT);
             }
             if (t.n_gen > 0) {
+                llama_bench_trace_section_begin(LLAMA_BENCH_SECTION_GEN);
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
@@ -2392,6 +2481,7 @@ int main(int argc, char ** argv) {
                     llama_model_free(lmodel);
                     exit(1);
                 }
+                llama_bench_trace_section_end(LLAMA_BENCH_SECTION_GEN);
             }
 
             uint64_t t_ns = get_time_ns() - t_start;
