@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cctype>
 #include <chrono>
 #include <cinttypes>
 #include <clocale>
@@ -37,13 +38,21 @@
     STAP_PROBE1(llama_cpp_llm, bench_section_begin, section)
 #define LLAMA_BENCH_SECTION_END(section) \
     STAP_PROBE1(llama_cpp_llm, bench_section_end, section)
+#define LLAMA_BENCH_PHASE_BEGIN(layer, phase) \
+    STAP_PROBE2(llama_cpp_llm, phase_begin, layer, phase)
+#define LLAMA_BENCH_PHASE_END(layer, phase) \
+    STAP_PROBE2(llama_cpp_llm, phase_end, layer, phase)
 #else
 #define LLAMA_BENCH_SECTION_BEGIN(section)
 #define LLAMA_BENCH_SECTION_END(section)
+#define LLAMA_BENCH_PHASE_BEGIN(layer, phase)
+#define LLAMA_BENCH_PHASE_END(layer, phase)
 #endif
 #else
 #define LLAMA_BENCH_SECTION_BEGIN(section)
 #define LLAMA_BENCH_SECTION_END(section)
+#define LLAMA_BENCH_PHASE_BEGIN(layer, phase)
+#define LLAMA_BENCH_PHASE_END(layer, phase)
 #endif
 
 #ifdef _WIN32
@@ -68,6 +77,18 @@ static bool llama_bench_usdt_trace_enabled() {
 enum llama_bench_usdt_section : int32_t {
     LLAMA_BENCH_SECTION_PROMPT = 1,
     LLAMA_BENCH_SECTION_GEN = 2,
+};
+
+enum llama_bench_usdt_phase : int32_t {
+    LLAMA_BENCH_PHASE_UNKNOWN    = 0,
+    LLAMA_BENCH_PHASE_ATTENTION  = 1,
+    LLAMA_BENCH_PHASE_KV_WRITE   = 2,
+    LLAMA_BENCH_PHASE_KV_READ    = 3,
+    LLAMA_BENCH_PHASE_FFN        = 4,
+    LLAMA_BENCH_PHASE_LM_HEAD    = 5,
+    LLAMA_BENCH_PHASE_OTHER      = 6,
+    LLAMA_BENCH_PHASE_RECURRENT  = 7,
+    LLAMA_BENCH_PHASE_CONV_STATE = 8,
 };
 
 static const char * llama_bench_trace_fifo_path() {
@@ -124,6 +145,129 @@ static void llama_bench_trace_section_end(int section) {
         LLAMA_BENCH_SECTION_END(section);
     }
     llama_bench_trace_fifo_emit("end", section);
+}
+
+static bool llama_bench_trace_name_contains(const ggml_tensor * t, const char * needle) {
+    if (t == nullptr || needle == nullptr) {
+        return false;
+    }
+    if (std::strstr(t->name, needle) != nullptr) {
+        return true;
+    }
+    for (const ggml_tensor * src : t->src) {
+        if (src != nullptr && std::strstr(src->name, needle) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int llama_bench_trace_parse_layer(const char * name) {
+    if (name == nullptr) {
+        return -1;
+    }
+
+    const char * blk = std::strstr(name, "blk.");
+    if (blk != nullptr) {
+        const char * p = blk + 4;
+        if (std::isdigit(static_cast<unsigned char>(*p))) {
+            return std::atoi(p);
+        }
+    }
+
+    const char * dash = std::strrchr(name, '-');
+    if (dash != nullptr && std::isdigit(static_cast<unsigned char>(dash[1]))) {
+        return std::atoi(dash + 1);
+    }
+
+    return -1;
+}
+
+static int llama_bench_trace_layer(const ggml_tensor * t) {
+    int layer = llama_bench_trace_parse_layer(t != nullptr ? t->name : nullptr);
+    if (layer >= 0) {
+        return layer;
+    }
+    if (t != nullptr) {
+        for (const ggml_tensor * src : t->src) {
+            layer = llama_bench_trace_parse_layer(src != nullptr ? src->name : nullptr);
+            if (layer >= 0) {
+                return layer;
+            }
+        }
+    }
+    return -1;
+}
+
+static llama_bench_usdt_phase llama_bench_trace_phase(const ggml_tensor * t) {
+    if (t == nullptr) {
+        return LLAMA_BENCH_PHASE_UNKNOWN;
+    }
+
+    switch (t->op) {
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_BACK:
+            return LLAMA_BENCH_PHASE_ATTENTION;
+        case GGML_OP_SSM_CONV:
+            return LLAMA_BENCH_PHASE_CONV_STATE;
+        case GGML_OP_SSM_SCAN:
+        case GGML_OP_GATED_LINEAR_ATTN:
+        case GGML_OP_GATED_DELTA_NET:
+            return LLAMA_BENCH_PHASE_RECURRENT;
+        case GGML_OP_GET_ROWS:
+            if (llama_bench_trace_name_contains(t, "cache_k") || llama_bench_trace_name_contains(t, "cache_v") ||
+                llama_bench_trace_name_contains(t, "cache_r") || llama_bench_trace_name_contains(t, "cache_s")) {
+                return LLAMA_BENCH_PHASE_KV_READ;
+            }
+            break;
+        case GGML_OP_CPY:
+            if (llama_bench_trace_name_contains(t, "cache_k") || llama_bench_trace_name_contains(t, "cache_v") ||
+                llama_bench_trace_name_contains(t, "cache_r") || llama_bench_trace_name_contains(t, "cache_s")) {
+                return LLAMA_BENCH_PHASE_KV_WRITE;
+            }
+            break;
+        default:
+            break;
+    }
+
+    if (llama_bench_trace_name_contains(t, "result_output") || llama_bench_trace_name_contains(t, "output_norm.weight")) {
+        return LLAMA_BENCH_PHASE_LM_HEAD;
+    }
+    if (llama_bench_trace_name_contains(t, ".ffn_") || llama_bench_trace_name_contains(t, "ffn_") ||
+        llama_bench_trace_name_contains(t, "swiglu")) {
+        return LLAMA_BENCH_PHASE_FFN;
+    }
+    if (llama_bench_trace_name_contains(t, "ssm_conv") || llama_bench_trace_name_contains(t, "conv_states") ||
+        llama_bench_trace_name_contains(t, "conv_input") || llama_bench_trace_name_contains(t, "conv_output")) {
+        return LLAMA_BENCH_PHASE_CONV_STATE;
+    }
+    if (llama_bench_trace_name_contains(t, ".ssm_") || llama_bench_trace_name_contains(t, "linear_attn") ||
+        llama_bench_trace_name_contains(t, "gated_delta") || llama_bench_trace_name_contains(t, "cache_s") ||
+        llama_bench_trace_name_contains(t, "cache_r")) {
+        return LLAMA_BENCH_PHASE_RECURRENT;
+    }
+    if (llama_bench_trace_name_contains(t, ".attn_") || llama_bench_trace_name_contains(t, "attn_") ||
+        llama_bench_trace_name_contains(t, "Qcur") || llama_bench_trace_name_contains(t, "Kcur") ||
+        llama_bench_trace_name_contains(t, "Vcur") || llama_bench_trace_name_contains(t, "cache_k") ||
+        llama_bench_trace_name_contains(t, "cache_v")) {
+        return LLAMA_BENCH_PHASE_ATTENTION;
+    }
+
+    return LLAMA_BENCH_PHASE_OTHER;
+}
+
+static bool llama_bench_usdt_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
+    (void) user_data;
+
+    const int phase = static_cast<int>(llama_bench_trace_phase(t));
+    const int layer = llama_bench_trace_layer(t);
+    if (ask) {
+        LLAMA_BENCH_PHASE_BEGIN(layer, phase);
+        return true;
+    }
+
+    LLAMA_BENCH_PHASE_END(layer, phase);
+    return true;
 }
 
 static bool tensor_buft_override_equal(const llama_model_tensor_buft_override& a, const llama_model_tensor_buft_override& b) {
@@ -1312,6 +1456,10 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        if (llama_bench_usdt_trace_enabled()) {
+            cparams.cb_eval           = llama_bench_usdt_eval_callback;
+            cparams.cb_eval_user_data = nullptr;
+        }
 
         return cparams;
     }
